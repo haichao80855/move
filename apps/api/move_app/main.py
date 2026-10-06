@@ -1,32 +1,48 @@
 import asyncio
+import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from typing import Literal
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import config, db, media, providers
-from .pipeline import Runner, audio_hash, directory
+from . import config, db, local_tts, media, providers
+from .pipeline import Runner, audio_hash, directory, export_signature
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.initialize()
+    app.state.tts_tools = local_tts.Tools()
     app.state.runner = Runner()
     app.state.runner.start()
     yield
     app.state.runner.close()
+    app.state.tts_tools.stop()
 
 
 app = FastAPI(title="Move · 视频翻译工作台", version="0.1.0", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    # Validation failures must not reflect an unsaved test key in the response.
+    if request.url.path == "/api/services/deepseek/test":
+        return JSONResponse(status_code=422, content={"detail": "请输入有效的模型名称和 API Key"})
+    return await request_validation_exception_handler(request, exc)
+
+
 origins = [
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -112,9 +128,9 @@ class SettingsUpdate(BaseModel):
     deepseek_model: str = Field(default="deepseek-chat", min_length=1, max_length=100)
     qwen_model: str = Field(default="qwen-plus", min_length=1, max_length=100)
     qwen_region: Literal["cn", "global"] = "cn"
-    tts_model: str = Field(default="speech-02-hd", min_length=1, max_length=100)
-    tts_region: Literal["cn", "global"] = "cn"
-    voice_id: str = Field(default="male-qn-jingying", min_length=1, max_length=150)
+    tts_provider: Literal["qwen3_mlx"] = "qwen3_mlx"
+    tts_model: Literal[config.TTS_MODEL] = config.TTS_MODEL
+    reference_id: str = Field(default="", max_length=32)
     speed: float = Field(default=1, ge=0.5, le=2)
     glossary: str = Field(default="", max_length=10000)
     translation_style: str = Field(default=db.DEFAULTS["translation_style"], max_length=3000)
@@ -123,6 +139,8 @@ class SettingsUpdate(BaseModel):
 
 @app.put("/api/settings")
 def put_settings(values: SettingsUpdate):
+    if values.reference_id and not local_tts.reference(values.reference_id):
+        raise HTTPException(400, "请选择有效的参考音频")
     try:
         for provider, key in values.keys.items():
             if len(key) > 1000:
@@ -136,12 +154,190 @@ def put_settings(values: SettingsUpdate):
     return settings()
 
 
-@app.get("/api/voices")
-def get_voices():
+class DeepSeekTest(BaseModel):
+    model: str = Field(min_length=1, max_length=100)
+    key: str = Field(default="", max_length=1000, repr=False)
+
+
+@app.post("/api/services/deepseek/test")
+def deepseek_test(values: DeepSeekTest):
+    return providers.test_deepseek(values.model.strip(), values.key)
+
+
+@app.get("/api/tts/status")
+def tts_status(request: Request):
+    return local_tts.status() | {"task": request.app.state.tts_tools.snapshot()}
+
+
+@app.post("/api/tts/prepare", status_code=202)
+def prepare_tts(request: Request):
+    if not local_tts.status()["runtime_installed"]:
+        raise HTTPException(400, local_tts.status()["note"])
+    with db.connect() as con:
+        if con.execute(
+            "SELECT 1 FROM jobs WHERE stage IN ('dub','export','transcribe','retranscribe') "
+            "AND status IN ('queued','running','cancelling')"
+        ).fetchone():
+            raise HTTPException(409, "请先完成或取消当前识别、配音与导出任务，再准备模型")
     try:
-        return providers.voices(db.settings(), threading.Event())
+        return request.app.state.tts_tools.start("prepare")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/tts/cancel")
+def cancel_tts(request: Request):
+    tools = request.app.state.tts_tools
+    task = tools.snapshot()
+    if task and task["status"] in {"queued", "running", "cancelling"}:
+        tools.cancel.set()
+    return {"ok": True}
+
+
+def public_reference(value: dict):
+    return value | {"audio_url": f"/api/tts/references/{value['id']}/audio"}
+
+
+@app.get("/api/tts/references")
+def list_references():
+    with db.connect() as con:
+        return [
+            public_reference(dict(row))
+            for row in con.execute("SELECT * FROM voice_references ORDER BY created DESC")
+        ]
+
+
+@app.post("/api/tts/references", status_code=201)
+async def upload_reference(file: UploadFile = File(...), transcript: str = Form(...)):
+    transcript = transcript.strip()
+    if not 1 <= len(transcript) <= 2000:
+        raise HTTPException(422, "请填写与参考音频一致的文字（1–2000 字）")
+    folder = config.DATA / "references"
+    folder.mkdir(parents=True, exist_ok=True)
+    reference_id = db.uid()
+    source, output = folder / f"{reference_id}.upload", folder / f"{reference_id}.wav"
+    try:
+        size = 0
+        with source.open("wb") as target:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > 20 * 1024 * 1024:
+                    raise HTTPException(413, "参考音频不能超过 20 MB")
+                target.write(chunk)
+        metadata = await asyncio.to_thread(media.probe, source)
+        if not metadata["has_audio"] or not 3 <= metadata["duration"] <= 30:
+            raise HTTPException(400, "请上传 3–30 秒的有效参考音频，推荐 5–15 秒清晰单人语音")
+        await asyncio.to_thread(
+            media.ffmpeg,
+            [
+                "-i",
+                str(source),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                "-c:a",
+                "pcm_s16le",
+                str(output),
+            ],
+            threading.Event(),
+            timeout=60,
+        )
+        name = (file.filename or "参考音频").replace("\\", "/").split("/")[-1][:200]
+        with db.connect() as con:
+            con.execute(
+                "INSERT INTO voice_references(id,name,transcript,audio_hash,duration,created) VALUES(?,?,?,?,?,?)",
+                (
+                    reference_id,
+                    name,
+                    transcript,
+                    hashlib.sha256(output.read_bytes()).hexdigest(),
+                    media.probe(output)["duration"],
+                    db.now(),
+                ),
+            )
+    except HTTPException:
+        output.unlink(missing_ok=True)
+        raise
     except Exception as exc:
+        output.unlink(missing_ok=True)
+        raise HTTPException(
+            400, "参考音频无法解码，请使用有效的 WAV、MP3、M4A 或 FLAC 文件"
+        ) from exc
+    finally:
+        source.unlink(missing_ok=True)
+        await file.close()
+    return public_reference(local_tts.reference(reference_id))
+
+
+class ReferenceUpdate(BaseModel):
+    transcript: str = Field(min_length=1, max_length=2000)
+
+
+@app.put("/api/tts/references/{reference_id}")
+def update_reference(reference_id: str, values: ReferenceUpdate, request: Request):
+    if not local_tts.reference(reference_id):
+        raise HTTPException(404, "参考音频不存在")
+    if not values.transcript.strip():
+        raise HTTPException(422, "参考文字不能为空")
+    task = request.app.state.tts_tools.snapshot()
+    if task and task["status"] in {"queued", "running", "cancelling"}:
+        raise HTTPException(409, "请先完成或取消模型准备／试听任务，再修改参考文字")
+    with db.connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        if con.execute(
+            "SELECT 1 FROM jobs WHERE stage IN ('dub','export') AND status IN ('queued','running','cancelling') "
+            "AND json_extract(payload,'$.settings.reference_id')=?",
+            (reference_id,),
+        ).fetchone():
+            raise HTTPException(409, "此参考音频正在用于配音／导出，请完成任务后修改")
+        con.execute(
+            "UPDATE voice_references SET transcript=? WHERE id=?",
+            (values.transcript.strip(), reference_id),
+        )
+    return public_reference(local_tts.reference(reference_id))
+
+
+@app.get("/api/tts/references/{reference_id}/audio")
+def reference_audio(reference_id: str):
+    if not local_tts.reference(reference_id):
+        raise HTTPException(404, "参考音频不存在")
+    path = local_tts.reference_path(reference_id)
+    if not path.is_file():
+        raise HTTPException(404, "参考音频文件不存在")
+    return FileResponse(path, media_type="audio/wav")
+
+
+class TTSPreview(BaseModel):
+    reference_id: str = Field(min_length=1, max_length=32)
+    text: str = Field(min_length=1, max_length=300)
+    speed: float = Field(default=1, ge=0.5, le=2)
+
+
+@app.post("/api/tts/preview", status_code=202)
+def preview_tts(values: TTSPreview, request: Request):
+    settings = db.settings() | {"reference_id": values.reference_id, "speed": values.speed}
+    if not values.text.strip():
+        raise HTTPException(422, "请填写测试配音文字")
+    try:
+        local_tts.require_ready(settings)
+    except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    try:
+        return request.app.state.tts_tools.start("preview", settings, values.text.strip())
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/tts/previews/{preview_id}")
+def preview_audio(preview_id: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", preview_id):
+        raise HTTPException(404, "测试配音不存在")
+    path = config.DATA / "tts-previews" / f"{preview_id}.wav"
+    if not path.is_file():
+        raise HTTPException(404, "测试配音尚未生成")
+    return FileResponse(path, media_type="audio/wav")
 
 
 @app.get("/api/projects")
@@ -205,6 +401,9 @@ async def upload(request: Request, file: UploadFile = File(...)):
 
 @app.get("/api/projects/{project_id}")
 def get_project(project_id: str):
+    # Completion is published after project/cue updates. Read it first so a completed
+    # job cannot be returned alongside project fields read before its final commit.
+    job_values = db.jobs(project_id)
     value = require_project(project_id)
     folder = directory(project_id)
     saved_settings = db.settings()
@@ -215,10 +414,10 @@ def get_project(project_id: str):
             and cue["audio_hash"] == audio_hash(cue, saved_settings)
             and (folder / cue["audio_file"]).is_file()
         )
-    signature = json.dumps(saved_settings, sort_keys=True)
+    signature = export_signature(saved_settings)
     return value | {
         "cues": all_cues,
-        "jobs": db.jobs(project_id),
+        "jobs": job_values,
         "preview_ready": (folder / "preview.mp4").is_file(),
         "audio_ready": (folder / "audio.wav").is_file(),
         "dubbing_ready": (folder / "dubbing.wav").is_file(),
@@ -277,7 +476,8 @@ def cue_audio(project_id: str, cue_id: str):
         or not (directory(project_id) / cue["audio_file"]).is_file()
     ):
         raise HTTPException(404, "该句尚未配音")
-    return FileResponse(directory(project_id) / cue["audio_file"], media_type="audio/mpeg")
+    path = directory(project_id) / cue["audio_file"]
+    return FileResponse(path, media_type="audio/wav" if path.suffix == ".wav" else "audio/mpeg")
 
 
 @app.get("/api/projects/{project_id}/waveform")
@@ -483,9 +683,14 @@ def enqueue(request: Request, project_id: str, values: JobRequest) -> dict:
     saved_settings = db.settings()
     if values.stage in {"transcribe", "retranscribe"} and not config.capabilities()["asr"]:
         raise HTTPException(400, config.capabilities()["asr_note"])
-    provider = saved_settings["translation_provider"] if values.stage == "translate" else "minimax"
-    if values.stage in {"translate", "dub"} and not providers.credential(provider):
+    provider = saved_settings["translation_provider"]
+    if values.stage == "translate" and not providers.credential(provider):
         raise HTTPException(400, f"请在设置中配置 {provider} API Key")
+    if values.stage == "dub":
+        try:
+            local_tts.require_ready(saved_settings)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     cues = db.cues(project_id)
     cue_ids = {c["id"] for c in cues}
     if not set(values.cue_ids) <= cue_ids:

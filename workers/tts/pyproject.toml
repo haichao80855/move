@@ -1,0 +1,7 @@
+[project]
+name = "move-tts"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "mlx-audio==0.5.8; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]

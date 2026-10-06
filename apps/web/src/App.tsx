@@ -36,6 +36,7 @@ import {
 import WaveSurfer from 'wavesurfer.js'
 import { active, api, stageName, time } from './api'
 import type { Cue, Job, Project, Settings, Stage, System } from './types'
+import { LocalTTSCard } from './LocalTTSCard'
 
 type Notice = { text: string; error?: boolean }
 const mediaUrl = (id: string, kind: string) => `/api/projects/${id}/media/${kind}`
@@ -331,7 +332,7 @@ export default function App() {
         <Modal title="开始你的第一支翻译视频" close={() => setHelp(false)}>
           <div className="help-steps">
             {[
-              '在模型与服务页配置 DeepSeek 或 Qwen，以及 MiniMax API Key。',
+              '在模型与服务页配置 DeepSeek 或 Qwen；准备本地 Qwen3-TTS 模型，并上传参考音频和对应文字。',
               '导入视频，在 Mac 上识别英文字幕；也可以直接导入 UTF-8 SRT。',
               '校对原文和时间轴，再翻译成中文。点击任意字幕时间即可定位视频。',
               '先选择几句生成配音并试听，再处理全部字幕。配音过长的句子会提示调整。',
@@ -345,7 +346,7 @@ export default function App() {
           </div>
           <div className="info-box">
             16 GB Mac
-            会串行加载识别模型。首次识别需下载模型；翻译文字和配音文字会发送至你选择的云端服务。
+            会串行加载识别和配音模型。首次使用需下载模型；翻译文字发送至你选择的云端翻译服务，配音文字和参考音频在本机处理。
           </div>
           <Button primary onClick={() => setHelp(false)}>
             开始创作
@@ -383,8 +384,7 @@ function Home({
     onDrop(event.dataTransfer.files[0])
   }
   const unconfigured =
-    settings &&
-    (!settings.credentials[settings.translation_provider] || !settings.credentials.minimax)
+    settings && (!settings.credentials[settings.translation_provider] || !settings.reference_id)
   return (
     <div className="home-page">
       <div className="page-heading">
@@ -442,7 +442,7 @@ function Home({
             {[
               [Subtitles, '识别与校对', '本机识别，逐句精修'],
               [Globe2, '上下文翻译', 'DeepSeek / Qwen'],
-              [AudioLines, '自然中文配音', '云端音色，先听再生成'],
+              [AudioLines, '自然中文配音', '本机参考音频，先听再生成'],
               [Film, '完成与导出', '视频、字幕、独立音轨'],
             ].map(([Icon, title, text], index) => {
               const ItemIcon = Icon as typeof Subtitles
@@ -466,7 +466,7 @@ function Home({
         <button className="setup-banner" onClick={settingsPage}>
           <span>
             <Cloud size={19} />
-            <strong>连接你的翻译与配音服务</strong>
+            <strong>配置翻译与本地配音</strong>
             <span>配置一次，下次直接开始创作。</span>
           </span>
           <span>
@@ -557,8 +557,19 @@ function SettingsPage({
   const [value, setValue] = useState(initial)
   const [keys, setKeys] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
-  const [voiceList, setVoiceList] = useState<{ id: string; name: string }[]>([])
-  const [loadingVoices, setLoadingVoices] = useState(false)
+  const [testingDeepSeek, setTestingDeepSeek] = useState(false)
+  const [deepSeekResult, setDeepSeekResult] = useState<{
+    ok: boolean
+    code: string
+    message: string
+    model: string
+    elapsed_ms: number
+  } | null>(null)
+  const checkVersion = useRef(0)
+  useEffect(() => {
+    checkVersion.current += 1
+    setDeepSeekResult(null)
+  }, [keys.deepseek, value.deepseek_model])
   const change = <K extends keyof Settings>(key: K, next: Settings[K]) =>
     setValue((v) => ({ ...v, [key]: next }))
   async function save() {
@@ -568,7 +579,9 @@ function SettingsPage({
         method: 'PUT',
         body: JSON.stringify({
           ...value,
-          keys: Object.fromEntries(Object.entries(keys).filter(([, key]) => key.trim())),
+          keys: system.apple_silicon
+            ? Object.fromEntries(Object.entries(keys).filter(([, key]) => key.trim()))
+            : {},
         }),
       })
       setKeys({})
@@ -580,15 +593,26 @@ function SettingsPage({
       setSaving(false)
     }
   }
-  async function loadVoices() {
-    setLoadingVoices(true)
+  async function testDeepSeek() {
+    const version = ++checkVersion.current
+    setTestingDeepSeek(true)
+    setDeepSeekResult(null)
     try {
-      setVoiceList(await api('/voices'))
-      notify('已连接 MiniMax，音色列表已更新')
+      const result = await api<{
+        ok: boolean
+        code: string
+        message: string
+        model: string
+        elapsed_ms: number
+      }>('/services/deepseek/test', {
+        method: 'POST',
+        body: JSON.stringify({ model: value.deepseek_model.trim(), key: keys.deepseek || '' }),
+      })
+      if (checkVersion.current === version) setDeepSeekResult(result)
     } catch (e) {
-      notify((e as Error).message, true)
+      if (checkVersion.current === version) notify((e as Error).message, true)
     } finally {
-      setLoadingVoices(false)
+      setTestingDeepSeek(false)
     }
   }
   return (
@@ -597,7 +621,7 @@ function SettingsPage({
         <div>
           <div className="eyebrow">MAKE IT YOURS</div>
           <h1>模型与服务</h1>
-          <p>本机识别，云端翻译与配音。选择适合你的组合。</p>
+          <p>本机识别与配音，云端翻译。选择适合你的组合。</p>
         </div>
         <Button primary onClick={save} disabled={saving}>
           {saving ? <Loader2 className="spin" size={16} /> : <Check size={16} />}保存设置
@@ -647,7 +671,7 @@ function SettingsPage({
                           ? '输入 API Key'
                           : `使用 ${provider.toUpperCase()}_API_KEY 环境变量`
                     }
-                    disabled={!system.apple_silicon}
+                    disabled={provider === 'qwen' && !system.apple_silicon}
                   />
                 </label>
               ))}
@@ -676,6 +700,35 @@ function SettingsPage({
                 </select>
               </label>
             </div>
+            <div className="deepseek-check">
+              <div className="settings-inline">
+                <Button
+                  onClick={testDeepSeek}
+                  disabled={
+                    testingDeepSeek ||
+                    !value.deepseek_model.trim() ||
+                    (!keys.deepseek?.trim() && !value.credentials.deepseek)
+                  }
+                >
+                  {testingDeepSeek ? <Loader2 size={15} className="spin" /> : <Globe2 size={15} />}
+                  {testingDeepSeek ? '正在测试 DeepSeek…' : '测试 DeepSeek 连接'}
+                </Button>
+                <small>使用当前填写的 Key 和模型；留空使用已有密钥，无需先保存。</small>
+              </div>
+              <p className="system-note">
+                测试会发送一次极短模型请求，可能产生少量费用。未提交的 Key 不会保存。
+                {!system.apple_silicon && ' 此系统的 Key 输入仅用于测试；持久化请使用环境变量。'}
+              </p>
+              {deepSeekResult && (
+                <p
+                  className={`connection-result ${deepSeekResult.ok ? 'good' : 'bad'}`}
+                  aria-live="polite"
+                >
+                  {deepSeekResult.message} · {deepSeekResult.model} · 耗时{' '}
+                  {deepSeekResult.elapsed_ms} ms
+                </p>
+              )}
+            </div>
             <label>
               翻译风格
               <textarea
@@ -694,86 +747,11 @@ function SettingsPage({
               />
             </label>
           </section>
-          <section className="settings-card">
-            <div className="card-title">
-              <span className="flow-icon tone-2">
-                <Mic2 size={20} />
-              </span>
-              <div>
-                <h2>中文配音 · MiniMax</h2>
-                <p>建议先试听几句，再批量生成。</p>
-              </div>
-            </div>
-            <div className="form-grid">
-              <label>
-                MiniMax API Key{' '}
-                <span className={`key-state ${value.credentials.minimax ? 'configured' : ''}`}>
-                  {value.credentials.minimax ? '已配置' : '未配置'}
-                </span>
-                <input
-                  type="password"
-                  autoComplete="off"
-                  value={keys.minimax || ''}
-                  onChange={(e) => setKeys((k) => ({ ...k, minimax: e.target.value }))}
-                  placeholder={
-                    system.apple_silicon ? '输入 API Key' : '使用 MINIMAX_API_KEY 环境变量'
-                  }
-                  disabled={!system.apple_silicon}
-                />
-              </label>
-              <label>
-                服务区域
-                <select
-                  value={value.tts_region}
-                  onChange={(e) => change('tts_region', e.target.value as 'cn' | 'global')}
-                >
-                  <option value="cn">中国内地</option>
-                  <option value="global">国际</option>
-                </select>
-              </label>
-              <label>
-                配音模型
-                <input
-                  value={value.tts_model}
-                  onChange={(e) => change('tts_model', e.target.value)}
-                />
-              </label>
-              <label>
-                语速 <span className="input-hint">{value.speed.toFixed(2)}×</span>
-                <input
-                  type="range"
-                  min="0.5"
-                  max="2"
-                  step="0.05"
-                  value={value.speed}
-                  onChange={(e) => change('speed', Number(e.target.value))}
-                />
-              </label>
-              <label className="full-width">
-                音色 ID
-                <input
-                  list="voice-list"
-                  value={value.voice_id}
-                  onChange={(e) => change('voice_id', e.target.value)}
-                  placeholder="输入或从列表选择音色"
-                />
-                <datalist id="voice-list">
-                  {voiceList.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {v.name}
-                    </option>
-                  ))}
-                </datalist>
-              </label>
-            </div>
-            <div className="settings-inline">
-              <Button onClick={loadVoices} disabled={loadingVoices || !value.credentials.minimax}>
-                {loadingVoices ? <Loader2 size={15} className="spin" /> : <Cloud size={15} />}
-                测试连接并读取音色
-              </Button>
-              <small>使用已保存的密钥与区域设置。</small>
-            </div>
-          </section>
+          <LocalTTSCard
+            value={value}
+            change={(fields) => setValue((current) => ({ ...current, ...fields }))}
+            notify={notify}
+          />
         </div>
         <aside className="settings-aside">
           <section className="settings-card">
@@ -805,7 +783,8 @@ function SettingsPage({
             </p>
           </section>
           <p className="privacy-note">
-            Mac 密钥保存在系统钥匙串。云端服务按账号实际用量计费；仅在开始对应任务时调用。
+            Mac 密钥保存在系统钥匙串。DeepSeek
+            连接测试会产生一次少量计费请求；中文配音完全在本机运行。
           </p>
         </aside>
       </div>
@@ -1278,10 +1257,8 @@ function Workspace({
                   <Mic2 size={19} />
                 </span>
                 <div>
-                  <strong>MiniMax 云端配音</strong>
-                  <small>
-                    {settings.voice_id} · {settings.speed.toFixed(2)}×
-                  </small>
+                  <strong>Qwen3-TTS 本地配音</strong>
+                  <small>0.6B Base · {settings.speed.toFixed(2)}×</small>
                 </div>
               </div>
               <div className="stage-stats">
@@ -1293,19 +1270,19 @@ function Workspace({
                 </span>
               </div>
               <button className="text-link" onClick={settingsPage}>
-                调整音色与语速
+                选择参考音频与语速
                 <ArrowRight size={14} />
               </button>
               <Button
                 primary
-                disabled={busy || !translated || !settings.credentials.minimax}
+                disabled={busy || !translated || !settings.reference_id}
                 onClick={() => job('dub')}
               >
                 <Mic2 size={16} />
                 {selected.length ? `配音选中 ${selected.length} 句` : '生成全部配音'}
               </Button>
               <div className="info-box">
-                勾选 2–3 句先试听。更改译文或音色后，只重新生成受影响的片段。
+                勾选 2–3 句先试听。需要先准备本地模型并保存参考音频设置；更改语速可复用原始配音。
               </div>
             </>
           )}

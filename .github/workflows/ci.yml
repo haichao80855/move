@@ -22,7 +22,7 @@ jobs:
       - name: Check and test
         working-directory: apps/api
         run: |
-          uv run ruff check move_app tests
+          uv run ruff check move_app tests ../../workers/tts/synthesize.py
           uv run pytest -q
   browser:
     runs-on: ubuntu-latest

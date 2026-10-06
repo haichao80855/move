@@ -7,7 +7,7 @@ import wave
 import pytest
 from conftest import settled
 
-from move_app import config, db, media, providers
+from move_app import config, db, local_tts, media, providers
 from move_app.pipeline import Runner, audio_hash, directory
 
 ORIGINAL = "1\n00:00:00,500 --> 00:00:01,400\nHello world.\n\n2\n00:00:02,000 --> 00:00:03,500\nWelcome to Move.\n"
@@ -57,10 +57,12 @@ def imported(client, project):
     return response.json()
 
 
-def test_real_video_dubbing_export_cache_and_invalidation(client, project, tmp_path, monkeypatch):
+def test_real_video_dubbing_export_cache_and_invalidation(
+    client, project, tmp_path, monkeypatch, local_runtime
+):
     project = imported(client, project)
     project_id = project["id"]
-    audio_path = tmp_path / "speech.mp3"
+    audio_path = tmp_path / "speech.wav"
     subprocess.run(
         [
             "ffmpeg",
@@ -78,13 +80,15 @@ def test_real_video_dubbing_export_cache_and_invalidation(client, project, tmp_p
         check=True,
     )
     calls = []
-    monkeypatch.setenv("MINIMAX_API_KEY", "contract-test-only")
 
-    def synthesis(text, settings, cancel):
-        calls.append(text)
-        return audio_path.read_bytes()
+    def synthesis(items, settings, cancel, progress):
+        for item in items:
+            calls.append(item["text"])
+            from pathlib import Path
 
-    monkeypatch.setattr(providers, "synthesize", synthesis)
+            Path(item["path"]).write_bytes(audio_path.read_bytes())
+
+    monkeypatch.setattr(local_tts, "generate", synthesis)
     assert client.post(f"/api/projects/{project_id}/jobs", json={"stage": "dub"}).status_code == 202
     project = settled(client, project_id)
     assert project["jobs"][0]["status"] == "completed", project["jobs"]
@@ -92,7 +96,11 @@ def test_real_video_dubbing_export_cache_and_invalidation(client, project, tmp_p
     assert len(calls) == 2
     client.post(f"/api/projects/{project_id}/jobs", json={"stage": "dub"})
     assert settled(client, project_id)["jobs"][0]["status"] == "completed"
-    assert len(calls) == 2, "Cached audio should not make paid calls again"
+    assert len(calls) == 2, "Cached audio should not run model inference again"
+    audio_response = client.get(f"/api/projects/{project_id}/cues/{project['cues'][0]['id']}/audio")
+    assert (
+        audio_response.status_code == 200 and audio_response.headers["content-type"] == "audio/wav"
+    )
     client.post(
         f"/api/projects/{project_id}/jobs", json={"stage": "export", "subtitle_mode": "bilingual"}
     )

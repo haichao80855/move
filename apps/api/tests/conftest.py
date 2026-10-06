@@ -1,10 +1,11 @@
+import json
 import subprocess
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
-from move_app import config
+from move_app import config, db, local_tts
 from move_app.main import app
 
 
@@ -72,4 +73,59 @@ def project(client, video):
     assert 0 < len(peaks["peaks"]) <= 1600
     assert abs(peaks["duration"] - 4) < 0.2
     assert 0 < max(peaks["peaks"]) <= 1
+    return value
+
+
+@pytest.fixture
+def reference_audio(tmp_path):
+    path = tmp_path / "reference.wav"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=800:sample_rate=24000",
+            "-t",
+            "4",
+            str(path),
+        ],
+        check=True,
+    )
+    return path
+
+
+@pytest.fixture
+def local_runtime(client, monkeypatch, reference_audio):
+    original = config.capabilities
+    monkeypatch.setattr(config, "capabilities", lambda: original() | {"apple_silicon": True})
+    monkeypatch.setattr(config, "TTS_PYTHON", config.ROOT / "apps/api/.venv/bin/python")
+    folder = local_tts.model_dir()
+    folder.mkdir(parents=True)
+    (folder / "config.json").write_text("{}")
+    (folder / "model.safetensors").write_bytes(b"contract-only-no-mlx")
+    (folder / "speech_tokenizer").mkdir()
+    (folder / "speech_tokenizer/config.json").write_text("{}")
+    (folder / "speech_tokenizer/model.safetensors").write_bytes(b"contract-only-no-mlx")
+    (folder / "ready.json").write_text(
+        json.dumps(
+            {
+                "model": config.TTS_MODEL,
+                "revision": "test-revision",
+                "worker": local_tts.WORKER_VERSION,
+            }
+        )
+    )
+    with reference_audio.open("rb") as source:
+        response = client.post(
+            "/api/tts/references",
+            files={"file": ("reference.wav", source)},
+            data={"transcript": "这是参考音频的文字。"},
+        )
+    assert response.status_code == 201, response.text
+    value = response.json()
+    db.save_settings({"reference_id": value["id"]})
     return value

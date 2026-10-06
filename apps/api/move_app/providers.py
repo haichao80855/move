@@ -39,6 +39,64 @@ def client():
     return httpx.Client(timeout=httpx.Timeout(180, connect=20))
 
 
+def test_deepseek(model: str, key: str = "") -> dict:
+    """One small, explicitly requested call; never persist input or repeat it."""
+    started = time.monotonic()
+
+    def result(ok, code, message):
+        return {
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "model": model,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+
+    key = key.strip() or credential("deepseek")
+    if not key:
+        return result(False, "credentials", "请填写 DeepSeek API Key，或配置已保存的密钥")
+    if not key.isascii() or any(ord(char) < 32 or ord(char) == 127 for char in key):
+        return result(False, "credentials", "API Key 格式无效，请检查是否粘贴了换行或其他文字")
+    if not model.strip():
+        return result(False, "model", "请填写模型名称")
+    try:
+        with client() as session:
+            response = session.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Reply OK."}],
+                    "max_tokens": 16,
+                    "stream": False,
+                },
+                timeout=httpx.Timeout(20, connect=5),
+            )
+        if response.status_code in {401, 403}:
+            return result(False, "credentials", "密钥无效或账号无访问权限，请检查 API Key")
+        if response.status_code == 402:
+            return result(False, "balance", "账号余额不足，请检查 DeepSeek 余额")
+        if response.status_code == 429:
+            return result(False, "rate_limit", "请求被限流，请稍后手动重试")
+        if response.status_code in {400, 404, 422}:
+            return result(False, "model", "所选模型不可用或不支持此请求，请检查模型名称")
+        if response.status_code >= 400:
+            return result(False, "service", "DeepSeek 服务暂时不可用，请稍后重试")
+        body = response.json()
+        message = body["choices"][0]["message"]
+        if not isinstance(message, dict) or not (
+            message.get("content") or message.get("reasoning_content")
+        ):
+            return result(False, "response", "服务未返回有效模型响应")
+        return result(True, "connected", "连接成功，所选模型已响应")
+    except httpx.TimeoutException:
+        return result(False, "timeout", "连接或响应超时，请检查网络后重试")
+    except httpx.TransportError:
+        return result(False, "network", "网络连接失败，请检查网络或代理设置")
+    except (ValueError, KeyError, TypeError, IndexError):
+        return result(False, "response", "服务返回格式异常，请稍后重试")
+
+
 def post(provider: str, url: str, body: dict, cancel) -> dict:
     key = credential(provider)
     if not key:
@@ -127,56 +185,3 @@ def translate(cues: list[dict], context: list[dict], settings: dict, cancel) -> 
         return {v["id"]: v["text"].strip() for v in values}
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise RuntimeError("翻译结果缺条、重复或格式错误，未覆盖原字幕；请重试此批次") from exc
-
-
-def synthesize(text: str, settings: dict, cancel) -> bytes:
-    base = (
-        "https://api.minimaxi.com" if settings["tts_region"] == "cn" else "https://api.minimax.io"
-    )
-    result = post(
-        "minimax",
-        base + "/v1/t2a_v2",
-        {
-            "model": settings["tts_model"],
-            "text": text,
-            "stream": False,
-            "voice_setting": {
-                "voice_id": settings["voice_id"],
-                "speed": settings["speed"],
-                "vol": 1,
-                "pitch": 0,
-            },
-            "audio_setting": {
-                "sample_rate": 32000,
-                "bitrate": 128000,
-                "format": "mp3",
-                "channel": 1,
-            },
-            "language_boost": "Chinese",
-            "output_format": "hex",
-        },
-        cancel,
-    )
-    status = result.get("base_resp", {}).get("status_code", 0)
-    if status:
-        raise RuntimeError(f"MiniMax 配音失败（错误码 {status}），请检查音色、模型、余额与区域设置")
-    try:
-        audio = bytes.fromhex(result["data"]["audio"])
-        if not audio:
-            raise ValueError("empty audio")
-        return audio
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("MiniMax 未返回有效音频") from exc
-
-
-def voices(settings: dict, cancel) -> list[dict]:
-    base = (
-        "https://api.minimaxi.com" if settings["tts_region"] == "cn" else "https://api.minimax.io"
-    )
-    result = post("minimax", base + "/v1/get_voice", {"voice_type": "system"}, cancel)
-    if result.get("base_resp", {}).get("status_code", 0):
-        raise RuntimeError("无法读取音色，请检查 MiniMax Key 和区域")
-    return [
-        {"id": v["voice_id"], "name": v.get("voice_name", v["voice_id"])}
-        for v in result.get("system_voice", [])
-    ]

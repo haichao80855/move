@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 
 const fixture = path.resolve('../../.move/e2e-fixtures/video.mp4')
+const referenceFixture = path.resolve('../../.move/e2e-fixtures/reference.wav')
 const srt =
   '1\n00:00:00,500 --> 00:00:01,500\nHello world.\n\n2\n00:00:02,000 --> 00:00:03,500\nWelcome to Move.\n'
 
@@ -31,6 +32,142 @@ test.beforeAll(() => {
     'aac',
     fixture,
   ])
+  execFileSync('ffmpeg', [
+    '-v',
+    'error',
+    '-y',
+    '-i',
+    fixture,
+    '-vn',
+    '-ac',
+    '1',
+    '-ar',
+    '24000',
+    referenceFixture,
+  ])
+})
+
+test('DeepSeek tests draft values and clears stale results without saving', async ({ page }) => {
+  const saved: string[] = []
+  page.on('request', (request) => {
+    if (request.url().endsWith('/api/settings') && request.method() === 'PUT')
+      saved.push(request.url())
+  })
+  let ok = true
+  await page.route('**/api/services/deepseek/test', async (route) => {
+    const body = route.request().postDataJSON()
+    expect(body.key).toBe('test-only-unsaved-key')
+    expect(body.model).toBe('deepseek-reasoner')
+    await route.fulfill({
+      json: {
+        ok,
+        code: ok ? 'connected' : 'timeout',
+        model: body.model,
+        elapsed_ms: 123,
+        message: ok ? '连接成功，所选模型已响应' : '连接或响应超时，请检查网络后重试',
+      },
+    })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: '模型与服务', exact: true }).click()
+  await page.getByLabel(/DeepSeek API Key/).fill('test-only-unsaved-key')
+  await page.getByLabel('DeepSeek 模型', { exact: true }).fill('deepseek-reasoner')
+  await page.getByRole('button', { name: '测试 DeepSeek 连接', exact: true }).click()
+  await expect(page.locator('.connection-result')).toContainText('连接成功')
+  await expect(page.locator('.connection-result')).toContainText('123 ms')
+  ok = false
+  await page.getByRole('button', { name: '测试 DeepSeek 连接', exact: true }).click()
+  await expect(page.locator('.connection-result')).toContainText('超时')
+  await page.getByLabel('DeepSeek 模型', { exact: true }).fill('different-model')
+  await expect(page.locator('.connection-result')).toHaveCount(0)
+  expect(saved).toEqual([])
+  await page.reload()
+  await page.getByRole('button', { name: '模型与服务', exact: true }).click()
+  await expect(page.getByLabel(/DeepSeek API Key/)).toHaveValue('')
+  await expect(page.getByLabel('DeepSeek 模型', { exact: true })).toHaveValue('deepseek-chat')
+})
+
+test('local TTS prepares model, uploads a real reference and previews draft settings', async ({
+  page,
+}) => {
+  let ready = false
+  let task: Record<string, unknown> | null = null
+  let referenceUrl = ''
+  const drafts: Record<string, unknown>[] = []
+  await page.route('**/api/tts/status', (route) =>
+    route.fulfill({
+      json: {
+        supported: true,
+        runtime_installed: true,
+        model_ready: ready,
+        model: 'mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+        note: ready ? '模型已下载并验证可加载' : '点击准备模型',
+        task,
+      },
+    }),
+  )
+  await page.route('**/api/tts/prepare', async (route) => {
+    ready = true
+    task = {
+      id: 'prepare-test',
+      status: 'completed',
+      progress: 1,
+      message: '模型准备完成',
+      error: null,
+      audio_url: null,
+    }
+    await route.fulfill({ status: 202, json: task })
+  })
+  await page.route('**/api/tts/preview', async (route) => {
+    drafts.push(route.request().postDataJSON())
+    task = {
+      id: 'preview-test',
+      status: 'completed',
+      progress: 1,
+      message: '测试配音已生成',
+      error: null,
+      audio_url: referenceUrl,
+    }
+    await route.fulfill({ status: 202, json: task })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: '模型与服务', exact: true }).click()
+  await page.getByRole('button', { name: '下载并准备模型', exact: true }).click()
+  await expect(page.getByText('已下载并验证加载', { exact: true })).toBeVisible()
+  await page.getByLabel('选择音频文件', { exact: true }).setInputFiles(referenceFixture)
+  await page.getByLabel('新参考音频对应文字', { exact: true }).fill('这是一段参考音频的原话。')
+  const uploaded = page.waitForResponse(
+    (r) => r.url().endsWith('/api/tts/references') && r.request().method() === 'POST',
+  )
+  await page.getByRole('button', { name: '上传参考音频', exact: true }).click()
+  const profile = await (await uploaded).json()
+  referenceUrl = profile.audio_url
+  await expect(page.getByLabel('参考文字', { exact: true })).toHaveValue('这是一段参考音频的原话。')
+  await expect(page.getByLabel('参考音频', { exact: true })).toHaveValue(profile.id)
+  await page.getByLabel('参考文字', { exact: true }).fill('修正后的参考音频原话。')
+  await page.getByRole('button', { name: '保存参考文字', exact: true }).click()
+  await expect(page.getByRole('button', { name: '保存参考文字', exact: true })).toBeDisabled()
+  await page.getByLabel('测试配音文字', { exact: true }).fill('这是当前填写的测试配音。')
+  await page.getByRole('button', { name: '生成测试配音', exact: true }).click()
+  await expect(page.getByLabel('测试配音试听', { exact: true })).toBeVisible()
+  await expect
+    .poll(() =>
+      page
+        .getByLabel('测试配音试听', { exact: true })
+        .evaluate((audio: HTMLAudioElement) => audio.duration),
+    )
+    .toBeGreaterThan(3)
+  expect(drafts).toEqual([{ reference_id: profile.id, speed: 1, text: '这是当前填写的测试配音。' }])
+  await page.getByRole('button', { name: '保存设置', exact: true }).click()
+  await expect(page.getByRole('status')).toContainText('设置已保存')
+  await page.reload()
+  await page.getByRole('button', { name: '模型与服务', exact: true }).click()
+  await expect(page.getByLabel('参考音频', { exact: true })).toHaveValue(profile.id)
+  await page.setViewportSize({ width: 390, height: 844 })
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  )
+  await page.screenshot({ path: '../../.move/settings-local-tts.png', fullPage: true })
 })
 
 test('real upload, subtitle edit, export and restore', async ({ page }) => {

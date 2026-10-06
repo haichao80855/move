@@ -56,7 +56,30 @@ def initialize():
           payload TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS voice_references (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, transcript TEXT NOT NULL,
+          audio_hash TEXT NOT NULL, duration REAL NOT NULL, created REAL NOT NULL
+        );
         """)
+        # Existing projects/media and Keychain entries are kept. Only switch the TTS defaults.
+        if not con.execute("SELECT 1 FROM settings WHERE key='tts_provider'").fetchone():
+            con.executemany(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                [
+                    (k, json.dumps(v))
+                    for k, v in {
+                        "tts_provider": "qwen3_mlx",
+                        "tts_model": config.TTS_MODEL,
+                        "reference_id": "",
+                    }.items()
+                ],
+            )
+        # Never silently run a queued legacy cloud dubbing job with a different backend.
+        con.execute(
+            "UPDATE jobs SET status='interrupted',message='配音已切换为本地 Qwen3-TTS，请准备参考音频后重试' "
+            "WHERE stage='dub' AND status='queued' AND "
+            "COALESCE(json_extract(payload,'$.settings.tts_provider'),'') != 'qwen3_mlx'"
+        )
 
 
 def project(project_id: str) -> dict | None:
@@ -140,9 +163,9 @@ DEFAULTS = {
     "deepseek_model": "deepseek-chat",
     "qwen_model": "qwen-plus",
     "qwen_region": "cn",
-    "tts_model": "speech-02-hd",
-    "tts_region": "cn",
-    "voice_id": "male-qn-jingying",
+    "tts_provider": "qwen3_mlx",
+    "tts_model": config.TTS_MODEL,
+    "reference_id": "",
     "speed": 1.0,
     "glossary": "",
     "translation_style": "自然、准确、适合口播。技术术语保持一致。",
@@ -154,7 +177,7 @@ def settings() -> dict:
         stored = {
             row["key"]: json.loads(row["value"]) for row in con.execute("SELECT * FROM settings")
         }
-    return DEFAULTS | stored
+    return DEFAULTS | {key: value for key, value in stored.items() if key in DEFAULTS}
 
 
 def save_settings(values: dict):

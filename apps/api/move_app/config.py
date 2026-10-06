@@ -6,6 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 DATA = Path(os.environ.get("MOVE_DATA_DIR", ROOT / ".move")).resolve()
 ASR_PYTHON = Path(os.environ.get("MOVE_ASR_PYTHON", ROOT / "workers/asr/.venv/bin/python"))
+TTS_PYTHON = Path(os.environ.get("MOVE_TTS_PYTHON", ROOT / "workers/tts/.venv/bin/python"))
+TTS_MODEL = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16"
 
 
 def capabilities() -> dict:

@@ -42,8 +42,8 @@ export interface Settings {
   qwen_model: string
   qwen_region: 'cn' | 'global'
   tts_model: string
-  tts_region: 'cn' | 'global'
-  voice_id: string
+  tts_provider: 'qwen3_mlx'
+  reference_id: string
   speed: number
   glossary: string
   translation_style: string

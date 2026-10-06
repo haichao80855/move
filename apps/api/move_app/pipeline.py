@@ -1,11 +1,10 @@
-import hashlib
 import json
 import math
 import queue
 import threading
 from pathlib import Path
 
-from . import config, db, media, providers
+from . import config, db, local_tts, media, providers
 
 
 def directory(project_id: str) -> Path:
@@ -13,11 +12,11 @@ def directory(project_id: str) -> Path:
 
 
 def audio_hash(cue: dict, settings: dict) -> str:
-    values = {key: settings[key] for key in ["voice_id", "speed", "tts_model", "tts_region"]}
-    values["text"] = cue["translation"]
-    return hashlib.sha256(
-        json.dumps(values, sort_keys=True, ensure_ascii=False).encode()
-    ).hexdigest()
+    return local_tts.signature(cue["translation"], settings)
+
+
+def export_signature(settings: dict) -> str:
+    return json.dumps(settings | {"tts_inputs": local_tts.signature("", settings)}, sort_keys=True)
 
 
 class Runner:
@@ -52,9 +51,8 @@ class Runner:
 
     def cancel(self, job_id: str):
         event = self.events.get(job_id)
-        if event:
-            event.set()
         with db.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
             if row and row["status"] in {"queued", "running", "cancelling"}:
                 status = "cancelled" if row["status"] == "queued" else "cancelling"
@@ -62,6 +60,9 @@ class Runner:
                     "UPDATE jobs SET status=?,message='正在取消；正在进行的服务请求需等待返回',updated=? WHERE id=?",
                     (status, db.now(), job_id),
                 )
+        # Publish the state first: a fast worker must not be overwritten with 'cancelling'.
+        if event:
+            event.set()
 
     def loop(self):
         while not self.stop.is_set():
@@ -168,18 +169,19 @@ class Runner:
                     cancel,
                 )
             output = folder / f"asr-{job['id']}.json"
-            media.run(
-                [
-                    str(config.ASR_PYTHON),
-                    str(config.ROOT / "workers/asr/transcribe.py"),
-                    str(source),
-                    str(output),
-                    "--engine",
-                    "whisper" if selected else "parakeet",
-                ],
-                cancel,
-                timeout=max(3600, project["metadata"]["duration"] * 15),
-            )
+            with local_tts.exclusive(cancel):
+                media.run(
+                    [
+                        str(config.ASR_PYTHON),
+                        str(config.ROOT / "workers/asr/transcribe.py"),
+                        str(source),
+                        str(output),
+                        "--engine",
+                        "whisper" if selected else "parakeet",
+                    ],
+                    cancel,
+                    timeout=max(3600, project["metadata"]["duration"] * 15),
+                )
             values = json.loads(output.read_text(encoding="utf-8"))
             values = [c for c in values if c.get("original", "").strip()]
             if not values:
@@ -224,23 +226,37 @@ class Runner:
                     db.changed(con, project_id)
             return
         if stage == "dub":
+            local_tts.require_ready(settings)
             if any(not c["translation"].strip() for c in selected):
                 raise ValueError("请先翻译或填写选中字幕的中文文字")
             (folder / "segments").mkdir(exist_ok=True)
+            missing = []
+            for cue in selected:
+                raw = (
+                    folder
+                    / "segments"
+                    / f"{local_tts.signature(cue['translation'], settings, False)}.raw.wav"
+                )
+                path = folder / "segments" / f"{audio_hash(cue, settings)}.wav"
+                if not path.exists() and not raw.exists():
+                    missing.append({"text": cue["translation"], "path": str(raw)})
+            if missing:
+                missing = list({item["path"]: item for item in missing}.values())
+                local_tts.generate(
+                    missing, settings, cancel, lambda value, message: progress(value * 0.8, message)
+                )
             for i, cue in enumerate(selected):
-                progress(i / len(selected), f"配音 {i + 1} / {len(selected)}；已完成片段自动复用")
+                progress(0.8 + 0.2 * i / len(selected), f"处理语速与缓存 {i + 1} / {len(selected)}")
                 signature = audio_hash(cue, settings)
-                name = f"segments/{signature}.mp3"
+                name = f"segments/{signature}.wav"
                 path = folder / name
                 if not path.exists():
-                    audio = providers.synthesize(cue["translation"], settings, cancel)
-                    temp = path.with_suffix(".tmp.mp3")
-                    temp.write_bytes(audio)
-                    duration = media.probe(temp)["duration"]
-                    if duration <= 0:
-                        temp.unlink(missing_ok=True)
-                        raise ValueError("配音服务返回不可播放的音频")
-                    temp.replace(path)
+                    raw = (
+                        folder
+                        / "segments"
+                        / f"{local_tts.signature(cue['translation'], settings, False)}.raw.wav"
+                    )
+                    local_tts.apply_speed(raw, path, settings["speed"], cancel)
                 duration = media.probe(path)["duration"]
                 with db.connect() as con:
                     con.execute(
@@ -369,7 +385,7 @@ class Runner:
         with db.connect() as con:
             con.execute(
                 "UPDATE projects SET export_revision=subtitle_revision,export_signature=?,updated=? WHERE id=?",
-                (json.dumps(settings, sort_keys=True), db.now(), project["id"]),
+                (export_signature(settings), db.now(), project["id"]),
             )
 
 
